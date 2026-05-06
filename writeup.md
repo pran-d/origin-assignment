@@ -57,21 +57,21 @@ The residual's per-state correction is well-suited to both failure modes — it 
 
 ## Bound magnitude
 
-DELTA_BOUND was calibrated from the data: computed `|a_demo - a_BC(s)|` across all state transitions and took the **75th percentile**. The intuition: the residual should be large enough to cover the typical BC error but not so large that it can override BC entirely. The 75th percentile ("large but not outlier") gives a tighter bound than the 90th percentile — using the 90th percentile (≈0.15) caused `delta_mag` to saturate at the bound, meaning the residual applied near-maximum corrections on every step, which overwhelmed BC's good predictions and degraded success rate from 90% to 20%. At the 75th percentile the bound is small enough to prevent this saturation while still covering the bulk of meaningful BC errors. The chosen bound should also be sufficiently smaller than the absolute range of actions in the demo dataset.
-
-## Observation noise during RL training
-
-Small Gaussian noise (std = 1% of per-feature standard deviation, i.e., `ε ~ N(0, 0.01 · σ_obs)`) is added to both `obs` and `next_obs` during every training step. This serves two purposes: (1) it prevents the Q-function from overfitting to the exact finite set of training observations (the offline dataset has only ~7,700 transitions in the training split), and (2) it makes the learned policy more robust to small observation perturbations at rollout time. Noise is scaled per-feature by the dataset's obs standard deviation so that high-variance features (e.g., cube position) and low-variance features (e.g., gripper qpos) receive perturbations proportional to their natural range.
+DELTA_BOUND was calibrated from the data: computed `|a_demo - a_BC(s)|` across all state transitions and took the **90th percentile**. The intuition: the residual should be large enough to cover the typical BC error but not so large that it can override BC entirely. The 90th percentile captures "large but not outlier" errors. The chosen bound should also be sufficiently smaller than the absolute range of actions in the demo dataset.
 
 ## Algorithm
 
 TD3+BC. The actor loss is:
 
 ```
-L_actor = - Q(s, a_executed) + λ * MSE(δ_θ(s), a_demo - a_BC(s))  
+L_actor = - λ * Q(s, a_executed) + BC_REG_COEF * MSE(δ_θ(s), a_demo - a_BC(s))  
 ```
 
-where `λ = ALPHA_BC / (mean(|Q|) + ε)` normalizes the Q scale so the RL and BC terms stay balanced as Q changes throughout training. The BC term trains the delta head to predict the oracle residual (the actual correction needed at each state). The oracle target is clamped to `±DELTA_BOUND` because anything beyond that range will not be physically realizable by the residual head. Note that with a large DELTA_BOUND both the RL term and the BC term push toward saturating the delta; using the 75th-percentile bound keeps oracle targets small enough that bc_reg actively constrains the delta rather than driving it to saturation.
+where `λ = ALPHA_BC / (mean(|Q|) + ε)` normalizes the Q scale so the RL term magnitude stays roughly constant as Q changes, and `BC_REG_COEF = 5.0` is an explicit multiplier on the BC regularization term.
+
+**Why BC_REG_COEF?** Without it, bc_reg converges toward zero within the first few hundred steps (the delta_net quickly learns to match the clamped oracle targets), while the RL term stays at roughly `-ALPHA_BC * sign(Q)` ≈ -2.5. This creates a >2000:1 imbalance, making the actor effectively a pure RL policy driven by a noisy offline Q-function. The result: delta_mag saturates at DELTA_BOUND every step, overriding BC and dropping success from 90% to 20%. `BC_REG_COEF = 5.0` keeps the BC guidance term actively competing with the RL term throughout training, anchoring the delta to meaningful corrections rather than drifting toward Q-maximizing but out-of-distribution actions.
+
+The BC term trains the delta head to predict the oracle residual (the actual correction needed at each state). The oracle target is clamped to `±DELTA_BOUND` because anything beyond that range will not be physically realizable by the residual head.
 
 The critic update is vanilla TD3-learning (Bellman), i.e. both Q networks should track the moving TD target, denoted by:
 ```
