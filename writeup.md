@@ -32,14 +32,16 @@ Fixed epoch count with manual inspection of the loss curve. The overfitting can 
 
 # Task 2 : BC failure-mode investigation
 
-The BC policy achieves 93% success, which is already very high. The remaining 7% failures are all identified to have the following features by inspecting per-rollout observation trajectories:
+The BC policy achieves ~90% success. The remaining failures are identified to have the following features by inspecting per-rollout observation trajectories:
 - The robot successfully reaches the cube but then the lift action saturates near zero because it is unable to grasp the cube. 
-- This could happen because BC averages over the entire action distribution — for high-precision tasks like grasping, we need extremely accurate control actions. 
-- A slight error would in turn make the next observations out of distribution for the model, thus compounding into a failure very easily. 
+- This could happen because BC averages over the entire action distribution — for high-precision tasks like grasping, we need extremely accurate control actions.
+- A slight error would in turn make the next observations out of distribution for the model, thus compounding into a failure very easily.
 
-**Diagnostic method:** Logged `gripper_to_cube_pos` norm, gripper_qpos, and action z-component across all 50 rollouts. Failed rollouts diagnostics were plotted and they were split by whether the min `gripper_to_cube_pos` norm ever went below 0.05 m (grasped) or not (missed). Of the 2 failures, both were below the threshold.
+**Out-of-distribution state compounding (covariate shift):** BC is trained on expert demonstrations, so the observation distribution during training is the expert's trajectory distribution. At test time, any small deviation from an expert trajectory — caused by BC's own prediction error — produces an observation that was never seen during training. BC then receives an out-of-distribution (OOD) input, makes a potentially larger error, which shifts the observation further from the training manifold, and so on. This covariate shift (DAgger, Ross & Bagnell 2011) is the root cause of BC's compounding failures: even a 90% per-step accuracy can compound to 0% success over a long horizon if OOD states are badly handled. The NN-distance analysis confirms this: failure rollout observations have a measurably larger mean distance to the nearest training observation compared to success rollouts, showing that BC failures coincide with OOD states.
 
- The residual's per-state correction is well-suited to any mode of failure — it can learn to push the EEF closer during approach and inject upward velocity post-grasp, without touching the well-performing majority of the BC trajectory.
+**Diagnostic method:** Logged `gripper_to_cube_pos` norm, gripper_qpos, and action z-component across all 50 rollouts. Failed rollouts were split by whether the min `gripper_to_cube_pos` norm ever went below 0.05 m. Additionally, nearest-neighbour L2 distance from each rollout observation to the training set was computed; failure rollouts show a heavier tail at large NN distances, confirming the OOD drift.
+
+The residual's per-state correction is well-suited to both failure modes — it can learn to push the EEF closer during approach and inject upward velocity post-grasp, without touching the well-performing majority of the BC trajectory. Crucially, because the residual is conditioned on `a_BC(s)`, it can identify and correct states where BC is about to make an OOD-induced error before executing the bad action.
 
 
 
@@ -55,7 +57,11 @@ The BC policy achieves 93% success, which is already very high. The remaining 7%
 
 ## Bound magnitude
 
-DELTA_BOUND was calibrated from the data: computed `|a_demo - a_BC(s)|` across all state transitions and took the 90th percentile. This gives **DELTA_BOUND = 0.0422**. The intuition: the residual should be large enough to cover the typical BC error but not so large that it can override BC entirely. The 90th percentile captures "large but not outlier" errors. The chosen bound should also be sufficiently smaller than the absolute range of actions in the demo dataset.
+DELTA_BOUND was calibrated from the data: computed `|a_demo - a_BC(s)|` across all state transitions and took the **75th percentile**. The intuition: the residual should be large enough to cover the typical BC error but not so large that it can override BC entirely. The 75th percentile ("large but not outlier") gives a tighter bound than the 90th percentile — using the 90th percentile (≈0.15) caused `delta_mag` to saturate at the bound, meaning the residual applied near-maximum corrections on every step, which overwhelmed BC's good predictions and degraded success rate from 90% to 20%. At the 75th percentile the bound is small enough to prevent this saturation while still covering the bulk of meaningful BC errors. The chosen bound should also be sufficiently smaller than the absolute range of actions in the demo dataset.
+
+## Observation noise during RL training
+
+Small Gaussian noise (std = 1% of per-feature standard deviation, i.e., `ε ~ N(0, 0.01 · σ_obs)`) is added to both `obs` and `next_obs` during every training step. This serves two purposes: (1) it prevents the Q-function from overfitting to the exact finite set of training observations (the offline dataset has only ~7,700 transitions in the training split), and (2) it makes the learned policy more robust to small observation perturbations at rollout time. Noise is scaled per-feature by the dataset's obs standard deviation so that high-variance features (e.g., cube position) and low-variance features (e.g., gripper qpos) receive perturbations proportional to their natural range.
 
 ## Algorithm
 
@@ -65,7 +71,7 @@ TD3+BC. The actor loss is:
 L_actor = - Q(s, a_executed) + λ * MSE(δ_θ(s), a_demo - a_BC(s))  
 ```
 
-where `λ = ALPHA_BC / (mean(|Q|) + ε)` normalizes the Q scale so the RL and BC terms stay balanced as Q changes throughout training. The BC term trains the delta head to predict the oracle residual (the actual correction needed at each state). The oracle target is clamped to `±DELTA_BOUND` because anything beyond that range will not make physical sense to add.
+where `λ = ALPHA_BC / (mean(|Q|) + ε)` normalizes the Q scale so the RL and BC terms stay balanced as Q changes throughout training. The BC term trains the delta head to predict the oracle residual (the actual correction needed at each state). The oracle target is clamped to `±DELTA_BOUND` because anything beyond that range will not be physically realizable by the residual head. Note that with a large DELTA_BOUND both the RL term and the BC term push toward saturating the delta; using the 75th-percentile bound keeps oracle targets small enough that bc_reg actively constrains the delta rather than driving it to saturation.
 
 The critic update is vanilla TD3-learning (Bellman), i.e. both Q networks should track the moving TD target, denoted by:
 ```
