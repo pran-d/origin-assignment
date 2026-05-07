@@ -86,15 +86,7 @@ With a small dataset, TD3+BC is simpler and well-validated on offline low-dim ta
 
 ## Reward
 
-Three shaped signals are added on top of the sparse terminal reward (1.0 on success):
-
-1. **Approach (potential-based):** `r_approach = γΦ(s') − Φ(s)`, where `Φ(s) = −‖gripper_to_cube_pos‖`. This is policy-invariant under the standard Ng et al. (1999) potential shaping theorem — adding it cannot change the set of optimal policies. The sparse reward alone gives the Q-function almost no gradient signal for approach behaviour; this term fills that gap without introducing bias.
-
-2. **Lift:** `r_lift = max(0, cube_z(s') − cube_z(s)) × 3.0`. Directly rewards upward cube movement, targeting the lift-stall failure mode where BC grasps the cube but applies near-zero z-velocity. A cube moves ~0.001–0.005 m per step, so each successful lift step contributes 0.003–0.015 to the return, which accumulates to ~0.15–0.75 across a lift phase — meaningful relative to the sparse reward of 1.0.
-
-3. **Grasp proxy:** `r_grasp = 0.3 × I[‖g2c‖ < 0.06] × I[gripper_qpos_sum < 0.035]`. Rewards the gripper being closed (Panda: open ≈ 0.08 sum, closed ≈ 0) while near the cube. This directly reinforces the contact phase where BC mode-1 failures occur.
-
-Pure sparse reward was tested first and produced the lower success rate (17%). The three-component shaping provides the Q-function with denser gradients specifically at the two identified failure modes (approach stall, lift stall), without biasing the approach component.
+Sparse terminal reward as provided (1.0 on success, 0 otherwise). Shaped rewards (e.g. `-|cube - eef|`) were considered but rejected: the vanilla BC is able to achieve a very high success rate, so sparse signals near the goal are sufficient. The BC model does not need additional guidance from RL to REACH the cube itself, it only needs it to GRASP it. Shaping introduces an additional hyperparameter (reward scale).
 
 
 ## Clip δ inside target Q
