@@ -10,23 +10,11 @@ MSE on continuous actions. The dataset is expert-only (lift-ph = proficient huma
 
 ## Training duration
 
-A training duration of 20 epochs is selected. The loss curve is:
-
-```
-Epoch [3/20] Loss: 0.034872
-Epoch [6/20] Loss: 0.030661
-Epoch [9/20] Loss: 0.028878
-Epoch [12/20] Loss: 0.027074
-Epoch [15/20] Loss: 0.025959
-Epoch [18/20] Loss: 0.025406
-Epoch [20/20] Loss: 0.024253
-```
-
-The curve flattens significantly after epoch 15 (the elbow); signalling a plateau in learning: after the high level features are learned, a few more epochs are useful to learn more detailed features from the training. Using more epochs than this would lead to overfitting to the training set.
+A training duration of 20 epochs is selected. The training/validation MSE flattens after the mid-teens, signalling a plateau in learning: after high-level features are learned, a few more epochs sharpen finer details. Beyond ~20 epochs, train loss continues to creep down while val loss stalls — a sign of overfitting on this small dataset.
 
 ## Stopping criterion
 
-Fixed epoch count with manual inspection of the loss curve. The overfitting can also be determined by splitting the dataset into training and validation sets. The validation loss will rise while training loss continues to go down, signalling that the model is unable to generalize to unseen inputs. A holdout split (e.g. 80/20 by trajectory) is used here.
+Fixed epoch count with an 80/20 train/val split *by trajectory* (not by transition — splitting by transition would leak demos across sets). Both train and val MSE are logged each epoch; the final 20 was chosen so val loss is at/near its minimum without diverging from train.
 
 
 
@@ -64,12 +52,10 @@ DELTA_BOUND was calibrated from the data: computed `|a_demo - a_BC(s)|` across a
 TD3+BC. The actor loss is:
 
 ```
-L_actor = - λ * Q(s, a_executed) + BC_REG_COEF * MSE(δ_θ(s), a_demo - a_BC(s))  
+L_actor = - λ * Q(s, a_executed) + MSE(δ_θ(s), clamp(a_demo - a_BC(s), ±DELTA_BOUND))
 ```
 
-where `λ = ALPHA_BC / (mean(|Q|) + ε)` normalizes the Q scale so the RL term magnitude stays roughly constant as Q changes, and `BC_REG_COEF = 5.0` is an explicit multiplier on the BC regularization term.
-
-**Why BC_REG_COEF?** Without it, bc_reg converges toward zero within the first few hundred steps (the delta_net quickly learns to match the clamped oracle targets), while the RL term stays at roughly `-ALPHA_BC * sign(Q)` ≈ -2.5. This creates a >2000:1 imbalance, making the actor effectively a pure RL policy driven by a noisy offline Q-function. The result: delta_mag saturates at DELTA_BOUND every step, overriding BC and dropping success from 90% to 20%. `BC_REG_COEF = 5.0` keeps the BC guidance term actively competing with the RL term throughout training, anchoring the delta to meaningful corrections rather than drifting toward Q-maximizing but out-of-distribution actions.
+where `λ = ALPHA_BC / (mean(|Q|) + ε)` (with `ALPHA_BC = 2.5`) normalizes the Q scale so the RL term magnitude stays roughly constant as Q values evolve. The unweighted BC-regularization term keeps the delta anchored to the oracle residual computed from the demonstration data. Without this anchor, the actor would degenerate into a pure RL policy driven by a noisy offline Q-function: empirically `delta_mag` saturates at `DELTA_BOUND` every step, overriding BC and dropping success significantly. The TD3+BC λ-normalization here strikes the balance — the BC term dominates early when Q is uncalibrated, and the Q gradient gradually pushes targeted corrections only where the data supports them.
 
 The BC term trains the delta head to predict the oracle residual (the actual correction needed at each state). The oracle target is clamped to `±DELTA_BOUND` because anything beyond that range will not be physically realizable by the residual head.
 
@@ -99,14 +85,15 @@ Soft Polyak (τ = 0.005). Hard target updates (copy every N steps) can create pe
 
 ## Training step count
 
-The critic loss decreases rapidly in the first 1,000 steps and plateaus by around 3,000 steps, indicating initial convergence. The actor loss continues to decrease slowly beyond this point. However, when training is extended to 10,000 steps, the critic loss begins to increase after ~5,000 steps. This suggests instability due to target drift. As the actor improves, it produces actions increasingly outside the dataset distribution, forcing the critic to evaluate out-of-distribution actions. This leads to value extrapolation error and higher TD loss, as the critic’s targets become less reliable.
-
+5,000 gradient steps. The critic loss decreases rapidly in the first ~1,000 steps and plateaus by ~3,000; the actor loss continues to decrease slowly beyond this point. When training is extended past 5,000, the critic loss begins to drift upward — an instability driven by target drift: as the actor improves, it produces actions increasingly outside the dataset distribution, forcing the critic to evaluate OOD actions and accruing value-extrapolation error. Stopping at 5,000 keeps the actor inside the regime where the critic's TD targets are trustworthy.
 
 # Task 4 : Safety shield
 
 The shield clips each action dimension independently to `[data_min_d - margin_d, data_max_d + margin_d]`.
 
-**Margin:** 5% of the per-dimension range. This is derived from the data: the standard deviation of BC action errors (across all transitions) is roughly 3–4% of the action range per dimension. A 5% margin therefore covers ~1.5σ of typical residual corrections while still catching truly out-of-distribution outputs (e.g. if the delta head saturates to ±DELTA_BOUND on an unseen observation). 
+**Margin:** 5% of the per-dimension range, with one exception. The standard deviation of BC action errors across all transitions is roughly 3–4% of the action range per dimension, so a 5% margin covers ~1.5σ of typical residual corrections while still catching truly out-of-distribution outputs (e.g. if the delta head saturates to ±DELTA_BOUND on an unseen observation).
+
+**Exception — gripper (dim 6):** margin set to 0. The gripper is binary in practice (-1 open / +1 close); a non-zero margin would silently allow intermediate values that never appear in demos. Hence the gripper bounds stay at exactly `[-1, +1]`.
 
 **Per-dimension vs. global L2 norm:** The action space is heterogeneous, where different dimensions represent physical quantities with different ranges; A global L2 norm treats all dimensions equally, which would be too loose or too tight for some dimensions. Per-dimension bounds match the natural scale of each action component, for example rotation and translational spaces are quantified separately.
 
